@@ -677,6 +677,10 @@ def load_cached_result(work_dir: Path, fingerprint: str,
         log.info("Vision cache model changed (%r -> %r); recomputing",
                  data.get("model"), cfg.ollama_vision_model)
         return None
+    if str(data.get("text_model") or "") != str(cfg.ollama_text_model):
+        log.info("Vision cache summary model changed (%r -> %r); recomputing",
+                 data.get("text_model"), cfg.ollama_text_model)
+        return None
     try:
         duration = float(data.get("duration", 0.0))
         raw_frames = data.get("frames")
