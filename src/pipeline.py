@@ -14,9 +14,9 @@ from .database import (AUTO_QUEUE_STATUSES, Database, DatabaseError,
 from .downloader import DownloadError, download
 from .editor import EditorError, render_vertical
 from .logging_setup import get_logger, stage_timer
-from .models import (AudioAnalysisResult, AudioEvent, CuratorDecision,
-                     FrameDescription, TranscriptSegment, TranscriptWord,
-                     VisionAnalysisResult)
+from .models import (AnalysisError, AudioAnalysisResult, AudioEvent,
+                     CuratorDecision, FrameDescription, TranscriptSegment,
+                     TranscriptWord, VisionAnalysisResult)
 from .moment import select_moment
 from .scoring import InvalidDecision
 from .subtitler import generate as generate_subtitles
@@ -220,12 +220,27 @@ class Pipeline:
             if audio is None:
                 if status != "ANALYZING":
                     self.db.update_status(clip_id, "ANALYZING", stage=stage)
-                with stage_timer(log, stage, clip_id):
-                    audio = analyze_audio(source, work, self.cfg)
-                    if self.cfg.analyze_vision:
-                        vision = analyze_vision(source, work, self.cfg)
-                    else:
-                        vision = VisionAnalysisResult(audio.duration, [], "")
+                try:
+                    with stage_timer(log, stage, clip_id):
+                        audio = analyze_audio(source, work, self.cfg)
+                        if self.cfg.analyze_vision:
+                            vision = analyze_vision(source, work, self.cfg)
+                        else:
+                            vision = VisionAnalysisResult(audio.duration, [], "")
+                except AnalysisError as exc:
+                    self.db.mark_analysis_error(
+                        clip_id, f"analysis: {exc}", stage)
+                    return {"ok": False, "clip_id": clip_id,
+                            "status": "ANALYSIS_ERROR", "error": str(exc)}
+                except Exception as exc:  # noqa: BLE001
+                    # Any failure while reading media / running a model is an
+                    # analysis failure, not a content rejection.
+                    self.db.mark_analysis_error(
+                        clip_id,
+                        f"analysis: {type(exc).__name__}: {exc}", stage)
+                    return {"ok": False, "clip_id": clip_id,
+                            "status": "ANALYSIS_ERROR",
+                            "error": f"{type(exc).__name__}: {exc}"}
                 self.db.save_analysis(
                     clip_id,
                     json.dumps({
@@ -236,6 +251,7 @@ class Pipeline:
                         "words": [word.__dict__ for word in audio.words],
                         "segments": [segment.__dict__ for segment in audio.segments],
                         "model": audio.model,
+                        "source_fingerprint": audio.source_fingerprint,
                     }, ensure_ascii=False),
                     json.dumps({
                         "duration": vision.duration,
@@ -243,6 +259,7 @@ class Pipeline:
                         "sequence_summary": vision.sequence_summary,
                         "scene_changes": vision.scene_changes,
                         "model": vision.model,
+                        "source_fingerprint": vision.source_fingerprint,
                     }, ensure_ascii=False),
                     version=ANALYSIS_VERSION,
                 )
@@ -271,7 +288,11 @@ class Pipeline:
                 with stage_timer(log, stage, clip_id,
                                  duration=f"{duration:.1f}s"):
                     try:
-                        decision = analyze_clip(audio, vision, duration, self.cfg)
+                        decision = analyze_clip(
+                            audio, vision, duration, self.cfg,
+                            game_name=str(clip.get("game_name") or ""),
+                            title=str(clip.get("title") or ""),
+                        )
                     except InvalidDecision as exc:
                         self.db.mark_analysis_error(
                             clip_id, f"curator: {exc}", stage)
@@ -289,17 +310,36 @@ class Pipeline:
             payload = {key: value for key, value in decision.__dict__.items()
                        if key != "raw"}
 
+            # Low-confidence candidates need a human or a stronger second pass.
+            if (decision.decision == "candidate"
+                    and decision.confidence < self.cfg.min_confidence):
+                decision.decision = "review"
+                decision.reason += (
+                    f" (confidence {decision.confidence:.2f} below "
+                    f"{self.cfg.min_confidence:.2f})"
+                )
+                payload["decision"] = "review"
+                payload["reason"] = decision.reason
+
             # 4. Gate: content rejection is distinct from analysis failure.
-            if (decision.decision == "reject"
-                    or decision.overall_score < self.cfg.min_score_review):
+            # A model "reject" with a high weighted score is a disagreement,
+            # not a confident rejection: send it to review instead of silently
+            # destroying a possible good moment.
+            score = decision.overall_score
+            if decision.decision == "reject":
+                if score >= self.cfg.min_score_review:
+                    self.db.save_decision(clip_id, payload, "REVIEW")
+                    return {"ok": True, "clip_id": clip_id,
+                            "decision": "review", "score": score,
+                            "reason": "model rejected but weighted score is high"}
                 self.db.save_decision(clip_id, payload, "REJECTED")
                 return {"ok": True, "clip_id": clip_id, "decision": "reject",
-                        "score": decision.overall_score}
+                        "score": score}
             if (decision.decision == "review"
-                    or decision.overall_score < self.cfg.min_score_candidate):
+                    or score < self.cfg.min_score_candidate):
                 self.db.save_decision(clip_id, payload, "REVIEW")
                 return {"ok": True, "clip_id": clip_id, "decision": "review",
-                        "score": decision.overall_score}
+                        "score": score}
 
             # 5. Edit the AI-selected moment of this exact source.
             if status != "APPROVED":

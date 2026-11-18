@@ -4,6 +4,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+class AnalysisError(RuntimeError):
+    """A media/model analysis failed; distinct from a content rejection."""
+
+
 @dataclass
 class TwitchClip:
     """A clip returned by a Twitch provider."""

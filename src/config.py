@@ -110,16 +110,19 @@ class Config:
     # Analysis
     frame_interval_sec: float = 1.5
     min_frames: int = 4
-    max_frames: int = 20
+    max_frames: int = 10
     scene_threshold: float = 0.3
     analyze_vision: bool = True
     vision_batch_size: int = 1
+    vision_frame_width: int = 768
 
     # Gating
     min_score_candidate: int = 60
     min_score_review: int = 40
     min_clip_duration: float = 8.0
     max_clip_duration: float = 45.0
+    min_confidence: float = 0.35
+    curator_temperature: float = 0.2
 
     # Editing
     video_width: int = 1080
@@ -217,6 +220,8 @@ class Config:
             errors.append("SCENE_THRESHOLD must be in 0..1")
         if not (1 <= self.vision_batch_size <= 4):
             errors.append("VISION_BATCH_SIZE must be in 1..4")
+        if not (320 <= self.vision_frame_width <= 1920):
+            errors.append("VISION_FRAME_WIDTH must be in 320..1920")
 
         if not (0 <= self.min_score_review <= 100):
             errors.append("MIN_SCORE_REVIEW must be in 0..100")
@@ -224,6 +229,10 @@ class Config:
             errors.append("MIN_SCORE_CANDIDATE must be in 0..100")
         if self.min_score_review > self.min_score_candidate:
             errors.append("MIN_SCORE_REVIEW cannot exceed MIN_SCORE_CANDIDATE")
+        if not (0.0 <= self.min_confidence <= 1.0):
+            errors.append("MIN_CONFIDENCE must be in 0..1")
+        if not (0.0 <= self.curator_temperature <= 1.5):
+            errors.append("CURATOR_TEMPERATURE must be in 0..1.5")
         if not (1 <= self.min_clip_duration <= 300):
             errors.append("MIN_CLIP_DURATION must be in 1..300 seconds")
         if not (self.min_clip_duration <= self.max_clip_duration <= 300):
@@ -328,10 +337,15 @@ def load_config(read_env: bool = True,
     cfg.scene_threshold = _getfloat("SCENE_THRESHOLD", cfg.scene_threshold)
     cfg.analyze_vision = _getbool("ANALYZE_VISION", cfg.analyze_vision)
     cfg.vision_batch_size = _getint("VISION_BATCH_SIZE", cfg.vision_batch_size)
+    cfg.vision_frame_width = _getint("VISION_FRAME_WIDTH",
+                                     cfg.vision_frame_width)
 
     cfg.min_score_candidate = _getint("MIN_SCORE_CANDIDATE",
                                       cfg.min_score_candidate)
     cfg.min_score_review = _getint("MIN_SCORE_REVIEW", cfg.min_score_review)
+    cfg.min_confidence = _getfloat("MIN_CONFIDENCE", cfg.min_confidence)
+    cfg.curator_temperature = _getfloat("CURATOR_TEMPERATURE",
+                                        cfg.curator_temperature)
     cfg.min_clip_duration = _getfloat("MIN_CLIP_DURATION",
                                       cfg.min_clip_duration)
     cfg.max_clip_duration = _getfloat("MAX_CLIP_DURATION",

@@ -109,7 +109,7 @@ def patch_success(monkeypatch, sample_video, decision=None, render=None):
         calls["vision"] += 1
         return make_vision()
 
-    def fake_curator(audio, vision, duration, cfg):
+    def fake_curator(audio, vision, duration, cfg, **kwargs):
         calls["curator"] += 1
         return decision or make_decision()
 
@@ -191,7 +191,7 @@ def test_resume_from_approved_reuses_decision(db, sample_video, monkeypatch):
     database.save_decision("c1", {
         "category": "Экшен", "overall_score": 85,
         "best_moment_start": 0.2, "best_moment_end": 1.2,
-        "decision": "candidate", "reason": "cached",
+        "decision": "candidate", "confidence": 0.9, "reason": "cached",
     }, "APPROVED")
 
     calls = patch_success(monkeypatch, sample_video)
@@ -298,4 +298,29 @@ def test_parallel_queue_respects_global_limit(db, sample_video, monkeypatch):
     stats = database.stats()
     assert stats["READY"] == 3
     assert stats["DISCOVERED"] == 1
+
+
+def test_reject_with_high_weighted_score_goes_to_review(db, sample_video,
+                                                       monkeypatch):
+    cfg, database = db
+    database.upsert_clip(make_clip())
+    patch_success(monkeypatch, sample_video,
+                  decision=make_decision(score=80, decision="reject"))
+    pipeline = Pipeline(cfg, database, twitch=object())
+    result = pipeline.process_one("c1")
+    assert result["decision"] == "review"
+    assert database.get_clip("c1")["status"] == "REVIEW"
+
+
+def test_reject_with_low_weighted_score_is_rejected(db, sample_video,
+                                                    monkeypatch):
+    cfg, database = db
+    database.upsert_clip(make_clip())
+    patch_success(monkeypatch, sample_video,
+                  decision=make_decision(score=10, decision="reject"))
+    pipeline = Pipeline(cfg, database, twitch=object())
+    result = pipeline.process_one("c1")
+    assert result["decision"] == "reject"
+    assert database.get_clip("c1")["status"] == "REJECTED"
+
 

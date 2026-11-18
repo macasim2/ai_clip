@@ -45,3 +45,43 @@ def test_missing_field():
     del raw["reason"]
     with pytest.raises(InvalidDecision):
         validate_decision(raw, 20.0)
+
+
+def test_reject_allows_zero_moment():
+    decision = validate_decision(_base(decision="reject", overall_score=5,
+                                       best_moment_start=0,
+                                       best_moment_end=0), 20.0)
+    assert decision.decision == "reject"
+    assert (decision.best_moment_start, decision.best_moment_end) == (0.0, 0.0)
+
+
+def test_candidate_with_zero_moment_is_invalid():
+    with pytest.raises(InvalidDecision):
+        validate_decision(_base(best_moment_start=0, best_moment_end=0), 20.0)
+
+
+def test_nan_factor_is_invalid():
+    with pytest.raises(InvalidDecision):
+        validate_decision(_base(unexpectedness=float("nan")), 20.0)
+
+
+def test_infinite_factor_is_invalid():
+    with pytest.raises(InvalidDecision):
+        validate_decision(_base(emotionality=float("inf")), 20.0)
+
+
+def test_confidence_range():
+    with pytest.raises(InvalidDecision):
+        validate_decision(_base(confidence=1.5), 20.0)
+
+
+def test_score_must_be_integer_range():
+    with pytest.raises(InvalidDecision):
+        validate_decision(_base(overall_score=101), 20.0)
+    with pytest.raises(InvalidDecision):
+        validate_decision(_base(overall_score=88.5), 20.0)
+
+
+def test_empty_reason_is_invalid():
+    with pytest.raises(InvalidDecision):
+        validate_decision(_base(reason="   "), 20.0)

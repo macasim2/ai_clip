@@ -1,4 +1,9 @@
-﻿"""Content-based interestingness scoring."""
+"""Content-based interestingness scoring and strict decision validation."""
+from __future__ import annotations
+
+import math
+from typing import Any, Dict
+
 from .logging_setup import get_logger
 from .models import CuratorDecision
 
@@ -28,64 +33,112 @@ class InvalidDecision(ValueError):
     pass
 
 
+def _number(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise InvalidDecision(f"{name} must be a number, got bool")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidDecision(f"{name} is not numeric: {value!r}") from exc
+    if not math.isfinite(number):
+        raise InvalidDecision(f"{name} must be finite, got {value!r}")
+    return number
+
+
 def compute_score(factors: dict) -> int:
-    return int(round(sum(float(factors.get(k, 0.0)) * w
-                         for k, w in WEIGHTS.items()) * 100))
+    total = sum(float(factors.get(key, 0.0)) * weight
+                for key, weight in WEIGHTS.items())
+    return int(round(max(0.0, min(1.0, total)) * 100))
 
 
 def validate_decision(raw: dict, video_duration: float) -> CuratorDecision:
     if not isinstance(raw, dict):
         raise InvalidDecision(f"Decision is not a dict: {type(raw).__name__}")
-    missing = [f for f in REQUIRED_FIELDS if f not in raw]
+    missing = [field for field in REQUIRED_FIELDS if field not in raw]
     if missing:
         raise InvalidDecision(f"Missing fields: {missing}")
 
-    for k in WEIGHTS:
-        v = raw[k]
-        if not isinstance(v, (int, float)) or not 0.0 <= float(v) <= 1.0:
-            raise InvalidDecision(f"{k} out of range 0..1: {v!r}")
+    factor_values: Dict[str, float] = {}
+    for key in WEIGHTS:
+        value = _number(raw[key], key)
+        if not 0.0 <= value <= 1.0:
+            raise InvalidDecision(f"{key} out of range 0..1: {value!r}")
+        factor_values[key] = value
 
-    cat = str(raw["category"])
-    if cat not in VALID_CATEGORIES:
-        raise InvalidDecision(f"Unknown category: {cat!r}")
-    dec = str(raw["decision"]).lower()
-    if dec not in VALID_DECISIONS:
-        raise InvalidDecision(f"Unknown decision: {dec!r}")
+    category = str(raw["category"]).strip()
+    if category not in VALID_CATEGORIES:
+        raise InvalidDecision(
+            f"Unknown category: {category!r}; expected one of "
+            f"{sorted(VALID_CATEGORIES)}"
+        )
+    decision = str(raw["decision"]).strip().lower()
+    if decision not in VALID_DECISIONS:
+        raise InvalidDecision(
+            f"Unknown decision: {decision!r}; expected one of "
+            f"{sorted(VALID_DECISIONS)}"
+        )
 
-    try:
-        bs = float(raw["best_moment_start"])
-        be = float(raw["best_moment_end"])
-    except (TypeError, ValueError):
-        raise InvalidDecision("best_moment timestamps are not numeric")
+    model_score = _number(raw["overall_score"], "overall_score")
+    if model_score != int(model_score) or not 0 <= model_score <= 100:
+        raise InvalidDecision(
+            f"overall_score must be an integer in 0..100, got {raw['overall_score']!r}"
+        )
+    confidence = _number(raw["confidence"], "confidence")
+    if not 0.0 <= confidence <= 1.0:
+        raise InvalidDecision(
+            f"confidence out of range 0..1: {confidence!r}"
+        )
 
-    if video_duration > 0:
-        bs = max(0.0, min(bs, video_duration))
-        be = max(0.0, min(be, video_duration))
-    if be <= bs:
-        raise InvalidDecision(f"best_moment_end ({be}) <= start ({bs})")
-
-    score = compute_score(raw)
-    model_score = int(raw.get("overall_score", -1))
-    if not 0 <= model_score <= 100:
-        raise InvalidDecision(f"overall_score out of 0..100: {model_score}")
-
-    if abs(score - model_score) > 20:
-        log.warning("Model score %d != weighted %d, using weighted",
-                    model_score, score)
+    start = _number(raw["best_moment_start"], "best_moment_start")
+    end = _number(raw["best_moment_end"], "best_moment_end")
+    duration = max(0.0, float(video_duration or 0.0))
+    if duration > 0:
+        start = max(0.0, min(start, duration))
+        end = max(0.0, min(end, duration))
+    if decision in {"candidate", "review"}:
+        if end <= start:
+            raise InvalidDecision(
+                f"best_moment_end ({end}) <= best_moment_start ({start}) "
+                f"for decision {decision!r}"
+            )
+        if duration > 0 and (start >= duration or end > duration + 0.001):
+            raise InvalidDecision(
+                f"best_moment {start}..{end} is outside video duration {duration}"
+            )
     else:
-        score = model_score
+        # A rejection may legitimately have no moment at all (0/0).
+        if end <= start:
+            start = end = 0.0
+
+    event_description = str(raw["event_description"]).strip()
+    reason = str(raw["reason"]).strip()
+    if not event_description:
+        raise InvalidDecision("event_description is empty")
+    if not reason:
+        raise InvalidDecision("reason is empty")
+
+    score = compute_score(factor_values)
+    if abs(score - int(model_score)) > 20:
+        log.warning("Model score %d differs from weighted %d; using weighted",
+                    int(model_score), score)
+    else:
+        score = int(model_score)
 
     return CuratorDecision(
-        category=cat, event_description=str(raw["event_description"]),
-        unexpectedness=float(raw["unexpectedness"]),
-        emotionality=float(raw["emotionality"]),
-        payoff_strength=float(raw["payoff_strength"]),
-        event_clarity=float(raw["event_clarity"]),
-        visual_interest=float(raw["visual_interest"]),
-        hook_strength=float(raw["hook_strength"]),
-        context_independence=float(raw["context_independence"]),
+        category=category,
+        event_description=event_description,
+        unexpectedness=factor_values["unexpectedness"],
+        emotionality=factor_values["emotionality"],
+        payoff_strength=factor_values["payoff_strength"],
+        event_clarity=factor_values["event_clarity"],
+        visual_interest=factor_values["visual_interest"],
+        hook_strength=factor_values["hook_strength"],
+        context_independence=factor_values["context_independence"],
         overall_score=score,
-        confidence=float(raw.get("confidence", 0.5)),
-        decision=dec, best_moment_start=bs, best_moment_end=be,
-        reason=str(raw["reason"]), raw=raw,
+        confidence=confidence,
+        decision=decision,
+        best_moment_start=round(start, 3),
+        best_moment_end=round(end, 3),
+        reason=reason,
+        raw=raw,
     )
