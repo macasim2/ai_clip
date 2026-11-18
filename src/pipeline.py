@@ -1,30 +1,33 @@
-"""End-to-end pipeline orchestration (foundation version).
-
-Stage 3 will add worker locks, resumable stage caching and parallel workers.
-This version already keeps every stage bound to one exact clip/source path,
-isolates per-clip failures and never marks READY without a verified export.
-"""
+"""Resumable, per-clip pipeline with explicit paths and stage caches."""
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .audio_analyzer import analyze_audio
 from .auto_curator import analyze_clip
-from .database import AUTO_QUEUE_STATUSES, Database
-from .downloader import DownloadError, download_clip
+from .database import (AUTO_QUEUE_STATUSES, Database, DatabaseError,
+                       default_worker_id)
+from .downloader import DownloadError, download
 from .editor import EditorError, render_vertical
 from .logging_setup import get_logger, stage_timer
-from .models import VisionAnalysisResult
+from .models import (AudioAnalysisResult, AudioEvent, CuratorDecision,
+                     FrameDescription, TranscriptSegment, TranscriptWord,
+                     VisionAnalysisResult)
+from .moment import select_moment
 from .scoring import InvalidDecision
 from .subtitler import generate as generate_subtitles
 from .twitch import TwitchAPI, TwitchAPIError
-from .utils import clamp, file_fingerprint, ffprobe_duration
+from .utils import (MediaError, file_fingerprint, probe_media, safe_filename)
 from .vision_analyzer import analyze_vision
 
 log = get_logger(__name__)
 
 ANALYSIS_VERSION = "2"
+SKIP_STATUSES = {"READY", "REJECTED", "REVIEW", "ANALYSIS_ERROR", "FAILED"}
 
 
 class Pipeline:
@@ -33,6 +36,7 @@ class Pipeline:
         self.db = db
         self.twitch = twitch or TwitchAPI.from_config(cfg)
 
+    # --------------------------------------------------------------- discovery
     def _check_prereqs(self) -> None:
         health = self.twitch.check_health()
         if not health.ok:
@@ -41,7 +45,7 @@ class Pipeline:
                 f"{health.detail}"
             )
 
-    def discover(self, game: str, limit: int, period: str = "week"):
+    def discover(self, game: str, limit: int, period: str = "week") -> list:
         self._check_prereqs()
         clips = self.twitch.get_clips(game, limit, period)
         if not clips:
@@ -51,109 +55,241 @@ class Pipeline:
         log.info("Discovered %d clip(s), new %d", len(clips), len(new))
         return new
 
-    def _clamp_times(self, start: float, end: float, duration: float):
-        """Guarantee min/max duration while keeping the requested window."""
-        if duration <= 0:
-            return 0.0, 0.0
-        start = clamp(float(start), 0.0, duration)
-        end = clamp(float(end), 0.0, duration)
-        if end <= start:
-            start, end = 0.0, duration
+    # ------------------------------------------------------------------ paths
+    def _find_source(self, clip: Dict[str, Any]) -> Optional[Path]:
+        candidates: List[Path] = []
+        if clip.get("local_path"):
+            candidates.append(Path(clip["local_path"]))
+        candidates.append(self.cfg.raw_clips / f"{clip['id']}_source.mp4")
+        for path in candidates:
+            try:
+                if path.is_file() and path.stat().st_size > 1024:
+                    info = probe_media(path)
+                    if info.is_valid_video:
+                        return path
+            except (OSError, MediaError):
+                continue
+        return None
 
-        min_duration = min(self.cfg.min_clip_duration, duration)
-        max_duration = min(self.cfg.max_clip_duration, duration)
-        if end - start < min_duration:
-            need = min_duration - (end - start)
-            start = max(0.0, start - need * 0.7)
-            end = min(duration, end + need * 0.3)
-            if end - start < min_duration:
-                end = min(duration, start + min_duration)
-            if end - start < min_duration:
-                start = max(0.0, end - min_duration)
-        if end - start > max_duration:
-            peak = (start + end) / 2
-            start = max(0.0, peak - max_duration / 2)
-            end = min(duration, start + max_duration)
-            if end - start > max_duration:
-                start = max(0.0, end - max_duration)
-        return round(start, 3), round(end, 3)
+    # ------------------------------------------------------------ cache loaders
+    @staticmethod
+    def _audio_from_dict(data: Dict[str, Any]) -> AudioAnalysisResult:
+        segments = [
+            TranscriptSegment(float(item["start"]), float(item["end"]),
+                              str(item.get("text", "")))
+            for item in data.get("segments", [])
+        ]
+        words = [
+            TranscriptWord(float(item["start"]), float(item["end"]),
+                           str(item.get("word", "")))
+            for item in data.get("words", [])
+        ]
+        events = []
+        for item in data.get("events", []):
+            events.append(AudioEvent(
+                kind=str(item.get("kind", "loud")),
+                start=float(item.get("start", 0)),
+                end=float(item.get("end", 0)),
+                intensity=float(item.get("intensity", 1.0)),
+                speech_overlap=bool(item.get("speech_overlap", False)),
+            ))
+        return AudioAnalysisResult(
+            language=str(data.get("language", "unknown")),
+            duration=float(data.get("duration", 0.0)),
+            segments=segments, words=words, events=events,
+            full_text=str(data.get("full_text", "")),
+            model=str(data.get("model", "")),
+            source_fingerprint=str(data.get("source_fingerprint", "")),
+        )
 
-    def process_one(self, clip_id: str) -> dict:
+    @staticmethod
+    def _vision_from_dict(data: Dict[str, Any]) -> VisionAnalysisResult:
+        frames = [
+            FrameDescription(
+                timestamp=float(item.get("timestamp", 0)),
+                description=str(item.get("description", "")),
+                path=str(item.get("path", "")),
+            )
+            for item in data.get("frames", [])
+        ]
+        return VisionAnalysisResult(
+            duration=float(data.get("duration", 0.0)),
+            frames=frames,
+            sequence_summary=str(data.get("sequence_summary", "")),
+            model=str(data.get("model", "")),
+            scene_changes=[float(x) for x in data.get("scene_changes", [])],
+            source_fingerprint=str(data.get("source_fingerprint", "")),
+        )
+
+    def _load_analysis(self, clip_id: str
+                       ) -> Tuple[Optional[AudioAnalysisResult],
+                                  Optional[VisionAnalysisResult]]:
+        row = self.db.get_analysis(clip_id)
+        if not row:
+            return None, None
+        try:
+            audio_raw = json.loads(row["audio_json"]) if row.get("audio_json") else None
+            vision_raw = json.loads(row["vision_json"]) if row.get("vision_json") else None
+            if not isinstance(audio_raw, dict) or not isinstance(vision_raw, dict):
+                return None, None
+            return (self._audio_from_dict(audio_raw),
+                    self._vision_from_dict(vision_raw))
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            log.warning("Cached analysis for %s is unreadable: %s", clip_id, exc)
+            return None, None
+
+    def _load_decision(self, clip_id: str) -> Optional[CuratorDecision]:
+        row = self.db.get_analysis(clip_id)
+        if not row or not row.get("decision_json"):
+            return None
+        try:
+            raw = json.loads(row["decision_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict) or "overall_score" not in raw:
+            return None
+        try:
+            return CuratorDecision(
+                category=str(raw.get("category", "")),
+                event_description=str(raw.get("event_description", "")),
+                unexpectedness=float(raw.get("unexpectedness", 0)),
+                emotionality=float(raw.get("emotionality", 0)),
+                payoff_strength=float(raw.get("payoff_strength", 0)),
+                event_clarity=float(raw.get("event_clarity", 0)),
+                visual_interest=float(raw.get("visual_interest", 0)),
+                hook_strength=float(raw.get("hook_strength", 0)),
+                context_independence=float(raw.get("context_independence", 0)),
+                overall_score=int(raw.get("overall_score", 0)),
+                confidence=float(raw.get("confidence", 0)),
+                decision=str(raw.get("decision", "review")),
+                best_moment_start=float(raw.get("best_moment_start", 0)),
+                best_moment_end=float(raw.get("best_moment_end", 0)),
+                reason=str(raw.get("reason", "")),
+                raw=raw,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    # --------------------------------------------------------------- one clip
+    def process_one(self, clip_id: str,
+                    worker_id: Optional[str] = None) -> Dict[str, Any]:
         clip = self.db.get_clip(clip_id)
         if not clip:
             return {"ok": False, "clip_id": clip_id, "error": "not in DB"}
-        if clip["status"] in ("READY", "REJECTED", "REVIEW", "ANALYSIS_ERROR",
-                              "FAILED"):
-            log.info("Skipping %s (status=%s)", clip_id, clip["status"])
+        status = clip["status"]
+        if status in SKIP_STATUSES:
+            log.info("Skipping %s (status=%s)", clip_id, status)
             return {"ok": True, "clip_id": clip_id, "skipped": True,
-                    "status": clip["status"]}
+                    "status": status}
 
         work = self.cfg.processed / clip_id
         work.mkdir(parents=True, exist_ok=True)
         stage = "start"
-
         try:
-            # 1. Download exact clip by id + URL; never pick by mtime.
-            stage = "download"
-            self.db.update_status(clip_id, "DOWNLOADING", stage=stage)
-            with stage_timer(log, stage, clip_id):
-                source = download_clip(
-                    clip, self.cfg.raw_clips,
-                    attempts=self.cfg.retry_attempts,
-                    min_free_mb=self.cfg.min_free_disk_mb,
-                )
-            self.db.set_local_path(clip_id, source,
-                                   fingerprint=file_fingerprint(source))
-            self.db.update_status(clip_id, "DOWNLOADED", stage=stage)
+            source = self._find_source(clip)
 
-            # 2. Audio + vision analysis (saved before the curator call).
-            stage = "analysis"
-            self.db.update_status(clip_id, "ANALYZING", stage=stage)
-            with stage_timer(log, stage, clip_id):
-                audio = analyze_audio(source, work, self.cfg)
-                if self.cfg.analyze_vision:
-                    vision = analyze_vision(source, work, self.cfg)
-                else:
-                    vision = VisionAnalysisResult(audio.duration, [], "")
-            self.db.save_analysis(
-                clip_id,
-                json.dumps({
-                    "language": audio.language,
-                    "full_text": audio.full_text,
-                    "events": [event.__dict__ for event in audio.events],
-                    "words": [word.__dict__ for word in audio.words],
-                }, ensure_ascii=False),
-                json.dumps({
-                    "frames": [frame.__dict__ for frame in vision.frames],
-                    "sequence_summary": vision.sequence_summary,
-                    "scene_changes": vision.scene_changes,
-                }, ensure_ascii=False),
-                version=ANALYSIS_VERSION,
-            )
-            self.db.update_status(clip_id, "ANALYZED", stage="curator")
-
-            # 3. Content-based curator. A model/JSON failure is NOT a normal
-            #    rejection and gets its own status.
-            stage = "curator"
-            duration = ffprobe_duration(source)
-            with stage_timer(log, stage, clip_id, duration=f"{duration:.1f}s"):
-                try:
-                    decision = analyze_clip(audio, vision, duration, self.cfg)
-                except InvalidDecision as exc:
-                    self.db.mark_analysis_error(clip_id, f"curator: {exc}", stage)
-                    return {"ok": False, "clip_id": clip_id,
-                            "status": "ANALYSIS_ERROR", "error": str(exc)}
-                except Exception as exc:  # noqa: BLE001 - model/transport error
-                    self.db.mark_analysis_error(
-                        clip_id, f"curator: {type(exc).__name__}: {exc}", stage
+            # 1. Download / verify exact source file.
+            if source is None:
+                stage = "download"
+                if status not in ("DOWNLOADING",):
+                    self.db.update_status(clip_id, "DOWNLOADING", stage=stage)
+                with stage_timer(log, stage, clip_id):
+                    result = download(
+                        clip, self.cfg.raw_clips,
+                        attempts=self.cfg.retry_attempts,
+                        min_free_mb=self.cfg.min_free_disk_mb,
                     )
-                    return {"ok": False, "clip_id": clip_id,
-                            "status": "ANALYSIS_ERROR", "error": str(exc)}
+                source = result.path
+                self.db.set_local_path(clip_id, source,
+                                       fingerprint=file_fingerprint(source))
+                self.db.update_status(clip_id, "DOWNLOADED", stage=stage)
+                status = "DOWNLOADED"
+            elif status == "DISCOVERED":
+                # Source survived a crash between download and DB update.
+                self.db.update_status(clip_id, "DOWNLOADING", stage="download")
+                self.db.set_local_path(clip_id, source,
+                                       fingerprint=file_fingerprint(source))
+                self.db.update_status(clip_id, "DOWNLOADED", stage="download")
+                status = "DOWNLOADED"
+
+            # 2. Audio + vision, reusing saved analysis after a restart.
+            stage = "analysis"
+            audio, vision = (None, None)
+            if status in ("ANALYZED", "APPROVED", "EDITING", "ANALYZING"):
+                audio, vision = self._load_analysis(clip_id)
+            if audio is None:
+                if status != "ANALYZING":
+                    self.db.update_status(clip_id, "ANALYZING", stage=stage)
+                with stage_timer(log, stage, clip_id):
+                    audio = analyze_audio(source, work, self.cfg)
+                    if self.cfg.analyze_vision:
+                        vision = analyze_vision(source, work, self.cfg)
+                    else:
+                        vision = VisionAnalysisResult(audio.duration, [], "")
+                self.db.save_analysis(
+                    clip_id,
+                    json.dumps({
+                        "language": audio.language,
+                        "duration": audio.duration,
+                        "full_text": audio.full_text,
+                        "events": [event.__dict__ for event in audio.events],
+                        "words": [word.__dict__ for word in audio.words],
+                        "segments": [segment.__dict__ for segment in audio.segments],
+                        "model": audio.model,
+                    }, ensure_ascii=False),
+                    json.dumps({
+                        "duration": vision.duration,
+                        "frames": [frame.__dict__ for frame in vision.frames],
+                        "sequence_summary": vision.sequence_summary,
+                        "scene_changes": vision.scene_changes,
+                        "model": vision.model,
+                    }, ensure_ascii=False),
+                    version=ANALYSIS_VERSION,
+                )
+                self.db.update_status(clip_id, "ANALYZED", stage="curator")
+                status = "ANALYZED"
+            else:
+                if status == "ANALYZING":
+                    self.db.update_status(clip_id, "ANALYZED", stage="curator")
+                    status = "ANALYZED"
+                elif status == "DOWNLOADED":
+                    self.db.update_status(clip_id, "ANALYZING", stage=stage)
+                    self.db.update_status(clip_id, "ANALYZED", stage="curator")
+                    status = "ANALYZED"
+
+            # 3. Curator decision, reused after a restart.
+            stage = "curator"
+            decision = self._load_decision(clip_id)
+            if decision is None:
+                duration = probe_media(source).duration
+                if status in ("APPROVED", "EDITING"):
+                    # A missing decision while already approved is inconsistent;
+                    # step back explicitly instead of inventing a decision.
+                    self.db.update_status(clip_id, "ANALYZED", force=True,
+                                          stage=stage)
+                    status = "ANALYZED"
+                with stage_timer(log, stage, clip_id,
+                                 duration=f"{duration:.1f}s"):
+                    try:
+                        decision = analyze_clip(audio, vision, duration, self.cfg)
+                    except InvalidDecision as exc:
+                        self.db.mark_analysis_error(
+                            clip_id, f"curator: {exc}", stage)
+                        return {"ok": False, "clip_id": clip_id,
+                                "status": "ANALYSIS_ERROR", "error": str(exc)}
+                    except Exception as exc:  # noqa: BLE001
+                        self.db.mark_analysis_error(
+                            clip_id,
+                            f"curator: {type(exc).__name__}: {exc}", stage)
+                        return {"ok": False, "clip_id": clip_id,
+                                "status": "ANALYSIS_ERROR", "error": str(exc)}
+            else:
+                duration = probe_media(source).duration
 
             payload = {key: value for key, value in decision.__dict__.items()
                        if key != "raw"}
 
-            # 4. Gate.
+            # 4. Gate: content rejection is distinct from analysis failure.
             if (decision.decision == "reject"
                     or decision.overall_score < self.cfg.min_score_review):
                 self.db.save_decision(clip_id, payload, "REJECTED")
@@ -165,60 +301,110 @@ class Pipeline:
                 return {"ok": True, "clip_id": clip_id, "decision": "review",
                         "score": decision.overall_score}
 
-            # 5. Edit around the AI-selected moment, exactly this source file.
-            self.db.save_decision(clip_id, payload, "APPROVED")
+            # 5. Edit the AI-selected moment of this exact source.
+            if status != "APPROVED":
+                self.db.save_decision(clip_id, payload, "APPROVED")
+                status = "APPROVED"
             self.db.update_status(clip_id, "EDITING", stage="edit")
             stage = "edit"
-            start, end = self._clamp_times(decision.best_moment_start,
-                                           decision.best_moment_end, duration)
+            moment = select_moment(
+                decision.best_moment_start, decision.best_moment_end,
+                duration, audio.words, audio.events, self.cfg,
+            )
             subtitles = None
             with stage_timer(log, "subtitles", clip_id,
-                             start=f"{start:.2f}", end=f"{end:.2f}"):
+                             start=f"{moment.start:.2f}",
+                             end=f"{moment.end:.2f}"):
                 if self.cfg.subtitles_enabled and audio.words:
-                    subtitles = generate_subtitles(clip_id, audio.words, work,
-                                                   start, end, self.cfg)
-                export_dir = self.cfg.exports / (decision.category or "Экшен")
+                    subtitles = generate_subtitles(
+                        clip_id, audio.words, work, moment.start, moment.end,
+                        self.cfg,
+                    )
+                category = safe_filename(decision.category or "clip")
+                export_dir = self.cfg.exports / category
                 export_dir.mkdir(parents=True, exist_ok=True)
-                output = export_dir / f"{clip_id}_{decision.category or 'clip'}.mp4"
-                render_vertical(clip_id, source, output, start, end,
-                                self.cfg, subtitles)
+                output = export_dir / f"{clip_id}_{category}.mp4"
+                render_vertical(clip_id, source, output, moment.start,
+                                moment.end, self.cfg, subtitles)
             self.db.set_export_path(clip_id, output)
             return {"ok": True, "clip_id": clip_id, "decision": "candidate",
-                    "score": decision.overall_score, "output": str(output)}
+                    "score": decision.overall_score, "output": str(output),
+                    "moment": [moment.start, moment.end]}
 
-        except (DownloadError, EditorError, TwitchAPIError) as exc:
+        except (DownloadError, EditorError) as exc:
             log.exception("Clip %s failed at stage=%s: %s", clip_id, stage, exc)
-            self.db.mark_failed(clip_id, f"{stage}: {exc}", stage)
+            self._safe_fail(clip_id, f"{stage}: {exc}", stage)
             return {"ok": False, "clip_id": clip_id, "status": "FAILED",
                     "error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - one clip must not kill queue
             log.exception("Clip %s failed at stage=%s: %s", clip_id, stage, exc)
-            try:
-                self.db.mark_failed(clip_id, f"{stage}: {type(exc).__name__}: {exc}",
-                                    stage)
-            except Exception:
-                log.exception("Could not persist failure for %s", clip_id)
+            self._safe_fail(clip_id, f"{stage}: {type(exc).__name__}: {exc}",
+                            stage)
             return {"ok": False, "clip_id": clip_id, "status": "FAILED",
                     "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if worker_id:
+                self.db.release(clip_id, worker_id)
+
+    def _safe_fail(self, clip_id: str, error: str, stage: str) -> None:
+        try:
+            self.db.mark_failed(clip_id, error, stage)
+        except Exception:
+            log.exception("Could not persist failure for %s", clip_id)
+
+    # ------------------------------------------------------------------ queue
+    def run_queue(self, game: Optional[str] = None,
+                  limit: Optional[int] = None) -> List[dict]:
+        workers = max(1, int(getattr(self.cfg, "max_parallel", 1)))
+        if workers == 1:
+            return self._run_queue_worker(game, limit, "worker-1")
+        results: List[dict] = []
+        limit_lock = threading.Lock()
+        processed = [0]
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(self._run_queue_worker, game, limit,
+                                f"worker-{index + 1}", limit_lock, processed)
+                for index in range(workers)
+            ]
+            for future in as_completed(futures):
+                try:
+                    results.extend(future.result())
+                except Exception:  # noqa: BLE001
+                    log.exception("Pipeline worker crashed")
+        return results
+
+    def _run_queue_worker(self, game: Optional[str], limit: Optional[int],
+                          worker_name: str, limit_lock=None,
+                          processed=None) -> List[dict]:
+        worker_id = f"{default_worker_id()}-{worker_name}"
+        results: List[dict] = []
+        while True:
+            if limit is not None and limit_lock is not None:
+                with limit_lock:
+                    if processed[0] >= limit:
+                        break
+                    processed[0] += 1
+            clip = self.db.claim_next(
+                worker_id=worker_id, game=game,
+                stale_minutes=self.cfg.stale_lock_minutes,
+            )
+            if clip is None:
+                if limit is not None and limit_lock is not None:
+                    with limit_lock:
+                        processed[0] = max(0, processed[0] - 1)
+                break
+            results.append(self.process_one(clip["id"], worker_id=worker_id))
+        return results
 
     def run(self, game: str, count: int, period: str = "week") -> List[dict]:
         discovery_error: Optional[str] = None
-        new = []
         try:
-            new = self.discover(game, count, period)
+            self.discover(game, count, period)
         except TwitchAPIError as exc:
-            # A temporary provider outage must not stop the local queue.
             discovery_error = str(exc)
             log.error("Discovery failed, continuing with the queue: %s", exc)
-        ids: List[str] = [clip.id for clip in new]
-        # Continue the existing queue: a restart must not lose DISCOVERED/
-        # DOWNLOADED/ANALYZED/APPROVED clips from an interrupted run.
-        for row in self.db.list_pending(game=game):
-            if row["status"] in AUTO_QUEUE_STATUSES and row["id"] not in ids:
-                ids.append(row["id"])
-        results = []
-        for clip_id in ids:
-            results.append(self.process_one(clip_id))
+        results = self.run_queue(game=game, limit=max(1, int(count)))
         if discovery_error and not results:
             results.append({"ok": False, "stage": "discover",
                             "error": discovery_error})

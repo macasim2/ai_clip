@@ -63,6 +63,7 @@ start.bat
 .venv\Scripts\python.exe -m src.main status --clip 2021748262
 .venv\Scripts\python.exe -m src.main review
 .venv\Scripts\python.exe -m src.main retry --clip 2021748262
+.venv\Scripts\python.exe -m src.main cleanup --dry-run
 .venv\Scripts\python.exe -m src.main health
 ```
 
@@ -71,6 +72,9 @@ start.bat
 - `retry --clip ID` вручную возвращает клип в работу; `--from-stage
   download|analysis|edit` выбирает, с какого этапа начать.
 - `review` показывает клипы, которым нужна ручная проверка.
+- `cleanup` удаляет старые `frames/`, `audio.wav` и временные файлы
+  завершённых клипов; исходники, экспорт и JSON-анализ не трогает.
+  `--orphans` разрешает удалить каталоги `processed/`, которых нет в БД.
 
 ## Статусы
 

@@ -6,7 +6,7 @@ import sys
 from typing import List, Optional
 
 from .config import ConfigError, load_config
-from .database import AUTO_QUEUE_STATUSES, Database, DatabaseError
+from .database import Database, DatabaseError
 from .logging_setup import get_logger, setup_logging
 from .pipeline import Pipeline
 from .twitch import TwitchAPI, TwitchAPIError
@@ -116,15 +116,7 @@ def _prepare_processing(db: Database, cfg) -> None:
 def _process_queue(cfg, db: Database, game: Optional[str],
                    limit: Optional[int] = None) -> List[dict]:
     pipeline = _make_pipeline(cfg, db)
-    rows = db.list_pending(game=game)
-    results = []
-    for row in rows:
-        if row["status"] not in AUTO_QUEUE_STATUSES:
-            continue
-        results.append(pipeline.process_one(row["id"]))
-        if limit and len(results) >= limit:
-            break
-    return results
+    return pipeline.run_queue(game=game, limit=limit)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -156,6 +148,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     sub.add_parser("review", help="Show clips that need review")
     sub.add_parser("health", help="Check Twitch, Ollama, FFmpeg and config")
+    cleanup = sub.add_parser("cleanup", help="Remove old intermediate files")
+    cleanup.add_argument("--days", type=int, default=None)
+    cleanup.add_argument("--dry-run", action="store_true")
+    cleanup.add_argument("--orphans", action="store_true")
 
     args = parser.parse_args(argv)
 
@@ -179,6 +175,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_review(db)
     if args.cmd == "health":
         return _cmd_health(cfg, db)
+    if args.cmd == "cleanup":
+        from .maintenance import cleanup
+
+        result = cleanup(cfg, db, days=args.days, dry_run=args.dry_run,
+                         orphans=args.orphans)
+        print(f"Cleanup: removed {result['removed_files']} item(s), "
+              f"{result['removed_bytes'] / (1024 * 1024):.1f} MB; "
+              f"kept {result['kept_pending']} pending clip(s); "
+              f"dry_run={result['dry_run']}")
+        return 0
 
     _prepare_processing(db, cfg)
 
