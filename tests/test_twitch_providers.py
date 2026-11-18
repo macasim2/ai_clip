@@ -142,6 +142,29 @@ def test_graphql_rate_limit_retry(monkeypatch):
     assert [clip.id for clip in clips] == ["a"]
 
 
+def test_graphql_service_error_is_retried(monkeypatch):
+    provider = graphql_provider(monkeypatch, [
+        gql(search_payload()),
+        FakeResponse(200, {"errors": [{"message": "service error",
+                                       "path": ["game", "clips"]}]}),
+        gql(clips_payload([clip_node("a")], has_next=False)),
+    ])
+    clips = provider.get_clips("Game", 1)
+    assert [clip.id for clip in clips] == ["a"]
+
+
+def test_graphql_persistent_service_error_is_provider_error(monkeypatch):
+    service_error = FakeResponse(200, {"errors": [{
+        "message": "service error", "path": ["game", "clips"]}]})
+    provider = graphql_provider(monkeypatch, [
+        gql(search_payload()),
+        service_error, service_error, service_error,
+    ])
+    with pytest.raises(TwitchProviderError):
+        provider.get_clips("Game", 1)
+
+
+
 def test_graphql_page_error_is_not_silently_partial(monkeypatch):
     provider = graphql_provider(monkeypatch, [
         gql(search_payload()),

@@ -46,5 +46,9 @@ if not errorlevel 1 (
 echo [3/3] Starting AI Clip Studio...
 "%PY%" -m src.launcher %*
 set "RC=%ERRORLEVEL%"
-if not "%RC%"=="0" pause
+if "%~1"=="" (
+    pause
+) else (
+    if not "%RC%"=="0" pause
+)
 exit /b %RC%

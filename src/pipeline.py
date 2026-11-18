@@ -94,9 +94,12 @@ class Pipeline:
     def _check_prereqs(self) -> None:
         health = self.twitch.check_health()
         if not health.ok:
-            raise TwitchAPIError(
-                f"Twitch provider '{self.twitch.provider_name}' is not usable: "
-                f"{health.detail}"
+            # Twitch occasionally returns a transient "service error" even
+            # when the provider works a second later.  Do not hard-block
+            # discovery or the local queue on a single failed health probe.
+            log.warning(
+                "Twitch provider '%s' health check failed, attempting discovery "
+                "anyway: %s", self.twitch.provider_name, health.detail,
             )
 
     def discover(self, game: str, limit: int, period: str = "week") -> list:

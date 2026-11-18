@@ -96,8 +96,11 @@ class TwitchGraphQLProvider(TwitchProvider):
     # ------------------------------------------------------------------ health
     def check_health(self) -> ProviderHealth:
         now = time.time()
-        if self._health_cache and now - self._health_cache[0] < 300:
-            return self._health_cache[1]
+        if self._health_cache:
+            cached_at, cached = self._health_cache
+            ttl = 300 if cached.ok else 15
+            if now - cached_at < ttl:
+                return cached
         try:
             search = self._query(SEARCH_GAME, {"query": "Counter-Strike"})
             edges = ((search.get("searchCategories") or {}).get("edges") or [])
@@ -170,6 +173,19 @@ class TwitchGraphQLProvider(TwitchProvider):
                 errors = payload.get("errors")
                 if errors:
                     message = str(errors[0] if errors else "unknown GraphQL error")
+                    if _is_transient_graphql_error(errors) and attempt < 2:
+                        last_error = f"transient GraphQL error: {message[:300]}"
+                        log.warning(
+                            "Twitch GraphQL transient error (attempt %d): %s",
+                            attempt + 1, message[:300],
+                        )
+                        time.sleep(1.5 ** attempt)
+                        continue
+                    if _is_transient_graphql_error(errors):
+                        raise TwitchProviderError(
+                            f"Twitch GraphQL is temporarily unavailable: "
+                            f"{message[:300]}"
+                        )
                     raise TwitchSchemaError(
                         f"Twitch GraphQL errors: {message[:500]}"
                     )
@@ -348,3 +364,21 @@ def _retry_after(response: Any, default: float) -> float:
     except (TypeError, ValueError):
         return max(0.5, min(default, 30.0))
     return max(0.5, min(wait, 30.0))
+
+
+def _is_transient_graphql_error(errors: Any) -> bool:
+    """Twitch sometimes returns a transient ``service error`` for game.clips.
+
+    It is not a schema change and must be retried instead of aborting the
+    whole discovery or health check.
+    """
+    text = str(errors).lower()
+    return any(token in text for token in (
+        "service error",
+        "internal server error",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "try again",
+        "upstream",
+    ))

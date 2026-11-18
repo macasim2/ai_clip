@@ -13,6 +13,7 @@ from src.models import (AudioAnalysisResult, CuratorDecision, DownloadResult,
                         ProviderHealth, TranscriptSegment, TranscriptWord,
                         TwitchClip, VisionAnalysisResult)
 from src.pipeline import Pipeline
+from src.twitch import TwitchAPIError
 
 
 @pytest.fixture
@@ -278,7 +279,8 @@ def test_discovery_failure_continues_queue(db, sample_video, monkeypatch):
     fake_twitch = SimpleNamespace(
         check_health=lambda: ProviderHealth(False, "fake", "offline"),
         provider_name="fake",
-        get_clips=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+        get_clips=lambda *a, **k: (_ for _ in ()).throw(
+            TwitchAPIError("temporary outage")),
     )
     pipeline = Pipeline(cfg, database, twitch=fake_twitch)
     results = pipeline.run("Test Game", 1)
