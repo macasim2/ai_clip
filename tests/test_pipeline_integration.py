@@ -100,3 +100,5 @@ def test_full_pipeline_with_real_render(tmp_path, sample_video, monkeypatch):
     assert 1.5 <= info.duration <= 3.0
     assert (cfg.processed / "int1" / "subtitles.ass").is_file()
     assert (cfg.processed / "int1" / "subtitles.srt").is_file()
+    assert (cfg.processed / "int1" / "analysis.json").is_file()
+    assert (cfg.processed / "int1" / "vertical.mp4").is_file()

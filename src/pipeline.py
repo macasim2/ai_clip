@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -21,7 +24,8 @@ from .moment import select_moment
 from .scoring import InvalidDecision
 from .subtitler import generate as generate_subtitles
 from .twitch import TwitchAPI, TwitchAPIError
-from .utils import (MediaError, file_fingerprint, probe_media, safe_filename)
+from .utils import (MediaError, file_fingerprint, probe_media, safe_filename,
+                    write_json)
 from .vision_analyzer import analyze_vision
 
 log = get_logger(__name__)
@@ -35,6 +39,56 @@ class Pipeline:
         self.cfg = cfg
         self.db = db
         self.twitch = twitch or TwitchAPI.from_config(cfg)
+
+    def _touch(self, clip_id: str, worker_id: Optional[str]) -> None:
+        """Refresh the worker lock so a long render is not treated as stale."""
+        if not worker_id:
+            return
+        try:
+            if not self.db.heartbeat(clip_id, worker_id):
+                log.warning("Lock for %s is no longer held by %s",
+                            clip_id, worker_id)
+        except Exception as exc:  # noqa: BLE001 - heartbeat must not kill a clip
+            log.warning("Heartbeat failed for %s: %s", clip_id, exc)
+
+    def _write_analysis_artifact(self, work: Path,
+                                 audio: Optional[AudioAnalysisResult],
+                                 vision: Optional[VisionAnalysisResult],
+                                 decision: Optional[Dict[str, Any]] = None,
+                                 moment=None) -> None:
+        """Persist a readable audit artifact next to transcript/vision caches."""
+        data: Dict[str, Any] = {}
+        if audio is not None:
+            data["audio"] = asdict(audio)
+        if vision is not None:
+            data["vision"] = asdict(vision)
+        if decision is not None:
+            data["decision"] = decision
+        if moment is not None:
+            data["moment"] = {"start": moment.start, "end": moment.end,
+                              "reason": moment.reason,
+                              "expanded": moment.expanded}
+        try:
+            write_json(work / "analysis.json", data)
+        except Exception as exc:  # noqa: BLE001 - audit artifact is best effort
+            log.warning("Could not write analysis.json for %s: %s",
+                        work.name, exc)
+
+    @staticmethod
+    def _link_vertical(work: Path, output: Path) -> None:
+        """Keep a processed/<clip_id>/vertical.mp4 audit copy without doubling I/O.
+
+        A hardlink is used on the same volume; otherwise fall back to a copy.
+        """
+        target = work / "vertical.mp4"
+        try:
+            target.unlink(missing_ok=True)
+            try:
+                os.link(output, target)
+            except OSError:
+                shutil.copy2(output, target)
+        except Exception as exc:  # noqa: BLE001 - export already verified
+            log.warning("Could not create vertical.mp4 artifact: %s", exc)
 
     # --------------------------------------------------------------- discovery
     def _check_prereqs(self) -> None:
@@ -204,6 +258,7 @@ class Pipeline:
                                        fingerprint=file_fingerprint(source))
                 self.db.update_status(clip_id, "DOWNLOADED", stage=stage)
                 status = "DOWNLOADED"
+                self._touch(clip_id, worker_id)
             elif status == "DISCOVERED":
                 # Source survived a crash between download and DB update.
                 self.db.update_status(clip_id, "DOWNLOADING", stage="download")
@@ -264,6 +319,8 @@ class Pipeline:
                     }, ensure_ascii=False),
                     version=ANALYSIS_VERSION,
                 )
+                self._write_analysis_artifact(work, audio, vision)
+                self._touch(clip_id, worker_id)
                 self.db.update_status(clip_id, "ANALYZED", stage="curator")
                 status = "ANALYZED"
             else:
@@ -310,6 +367,8 @@ class Pipeline:
 
             payload = {key: value for key, value in decision.__dict__.items()
                        if key != "raw"}
+            self._write_analysis_artifact(work, audio, vision, decision=payload)
+            self._touch(clip_id, worker_id)
 
             # Low-confidence candidates need a human or a stronger second pass.
             if (decision.decision == "candidate"
@@ -352,6 +411,9 @@ class Pipeline:
                 decision.best_moment_start, decision.best_moment_end,
                 duration, audio.words, audio.events, self.cfg,
             )
+            self._write_analysis_artifact(work, audio, vision,
+                                          decision=payload, moment=moment)
+            self._touch(clip_id, worker_id)
             subtitles = None
             with stage_timer(log, "subtitles", clip_id,
                              start=f"{moment.start:.2f}",
@@ -367,6 +429,8 @@ class Pipeline:
                 output = export_dir / f"{clip_id}_{category}.mp4"
                 render_vertical(clip_id, source, output, moment.start,
                                 moment.end, self.cfg, subtitles)
+            self._link_vertical(work, output)
+            self._touch(clip_id, worker_id)
             self.db.set_export_path(clip_id, output)
             return {"ok": True, "clip_id": clip_id, "decision": "candidate",
                     "score": decision.overall_score, "output": str(output),
