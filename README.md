@@ -56,6 +56,32 @@ ollama pull llava:latest
 
 Секреты хранятся только в `.env`; файл исключён из Git.
 
+## Перенос на другое устройство
+
+Репозиторий содержит все каталоги проекта (`src/`, `tests/`, `docs/`,
+`raw_clips/`, `processed/`, `exports/`, `logs/`, `data/`), но **не содержит**
+видео, базу, логи, `.venv` и секреты. Пустые каталоги сохранены через
+`.gitkeep`, поэтому структура появится сразу после клонирования.
+
+На новой машине:
+
+```bat
+git clone https://github.com/macasim2/ai_clip.git
+cd ai_clip
+copy .env.example .env
+start.bat
+```
+
+Перед запуском установите:
+- Python 3.10–3.14;
+- FFmpeg (обязательно `ffmpeg` и `ffprobe` в `PATH`);
+- [Ollama](https://ollama.com) и модели:
+  `ollama pull llama3.2:latest` и `ollama pull llava:latest`.
+
+`start.bat` сам создаст `.venv`, поставит зависимости и проверит окружение.
+База `data/clips.db` создастся при первом запуске; старые клипы и видео в
+репозиторий не входят.
+
 ## Запуск
 
 ```bat

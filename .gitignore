@@ -8,17 +8,23 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 
-# runtime data
-logs/
-exports/
+# runtime data (keep the directory placeholders for a fresh clone)
+logs/*
+!logs/.gitkeep
+exports/*
+!exports/.gitkeep
+!exports/**/
+!exports/**/.gitkeep
+processed/*
+!processed/.gitkeep
 raw_clips/*.mp4
 raw_clips/*.part*
 raw_clips/.tmp/
-processed/*/
 data/*.db
 data/*.db-wal
 data/*.db-shm
-data/backups/
+data/backups/*
+!data/backups/.gitkeep
 
 # media / binaries
 ffmpeg.exe
