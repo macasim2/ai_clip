@@ -6,6 +6,8 @@
 Среда: Windows, Python 3.14.6 в `.venv`, FFmpeg/ffprobe в PATH, Ollama 0.40.13,
 `llama3.2:latest` + `llava:latest`.
 
+Построчная сверка с ТЗ: [TZ_COMPLIANCE.md](<TZ_COMPLIANCE.md>).
+
 ## Критерии готовности MVP
 
 | # | Критерий | Статус | Доказательство |
