@@ -1,0 +1,28 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# runtime data
+logs/
+exports/
+raw_clips/*.mp4
+raw_clips/*.part*
+processed/*/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# media / binaries
+ffmpeg.exe
+*.mp4
+*.wav
+
+# os
+Thumbs.db
+desktop.ini
