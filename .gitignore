@@ -13,10 +13,12 @@ logs/
 exports/
 raw_clips/*.mp4
 raw_clips/*.part*
+raw_clips/.tmp/
 processed/*/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/backups/
 
 # media / binaries
 ffmpeg.exe

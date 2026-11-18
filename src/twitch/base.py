@@ -1,6 +1,8 @@
+"""Common Twitch provider interface."""
 from abc import ABC, abstractmethod
 from typing import List
-from ..models import TwitchClip
+
+from ..models import ProviderHealth, TwitchClip
 
 
 class TwitchProvider(ABC):
@@ -13,4 +15,14 @@ class TwitchProvider(ABC):
 
     @abstractmethod
     def get_clips(self, game_name: str, limit: int, period: str = "week",
-                  max_pages: int = 10) -> List[TwitchClip]: ...
+                  max_pages: int = 20) -> List[TwitchClip]: ...
+
+    def check_health(self) -> ProviderHealth:
+        """Detailed health information; providers may override this."""
+        try:
+            ok = self.health_check()
+            return ProviderHealth(ok=ok, provider=self.name,
+                                  detail="OK" if ok else "unreachable")
+        except Exception as exc:  # noqa: BLE001 - health must never raise
+            return ProviderHealth(ok=False, provider=self.name,
+                                  detail=f"{type(exc).__name__}: {exc}")

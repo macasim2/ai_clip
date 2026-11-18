@@ -1,7 +1,12 @@
-﻿requests>=2.31
-python-dotenv>=1.0
-faster-whisper>=1.0.3
+# Core HTTP / config
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+
+# Media / analysis
+# faster-whisper brings ctranslate2, tokenizers, huggingface-hub and onnxruntime.
+faster-whisper>=1.0.3,<2
 yt-dlp>=2024.4.9
-numpy>=1.26
-opencv-python-headless>=4.9
-python -m pip install pytest
+numpy>=1.26,<3
+
+# Tests (also installed for users so start.bat can verify the project)
+pytest>=8,<10

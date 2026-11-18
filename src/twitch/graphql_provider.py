@@ -1,22 +1,33 @@
-"""Temporary Twitch web GraphQL provider (no 2FA required)."""
+"""Temporary Twitch web GraphQL provider (no own app credentials required).
+
+This is the default provider because the project owner cannot currently
+register a Twitch application (2FA).  It uses the public Twitch web Client-ID
+and the same GraphQL operations the website uses.  It must never be treated
+as an official application credential, and the pipeline must keep working
+without TWITCH_CLIENT_ID/SECRET.
+"""
+from __future__ import annotations
+
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from ..logging_setup import get_logger
-from ..models import TwitchClip
+from ..models import ProviderHealth, TwitchClip
 from ..utils import normalize_game_name
 from .base import TwitchProvider
+from .errors import (TwitchAPIError, TwitchAuthError, TwitchGameNotFound,
+                     TwitchProviderError, TwitchRateLimitError,
+                     TwitchSchemaError)
 
 log = get_logger(__name__)
 
 GQL_URL = "https://gql.twitch.tv/gql"
 DEFAULT_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 
-# 1. Запрос для поиска ID игры по названию
 SEARCH_GAME = """query SearchCategory($query: String!) {
-  searchCategories(query: $query, first: 1) {
+  searchCategories(query: $query, first: 5) {
     edges {
       node {
         id
@@ -26,7 +37,6 @@ SEARCH_GAME = """query SearchCategory($query: String!) {
   }
 }"""
 
-# 2. Запрос клипов по ID игры
 GAME_CLIPS_BY_ID = """query ClipsCards__Game($id: ID!, $limit: Int, $cursor: Cursor, $criteria: GameClipsInput) {
   game(id: $id) {
     id
@@ -51,131 +61,290 @@ GAME_CLIPS_BY_ID = """query ClipsCards__Game($id: ID!, $limit: Int, $cursor: Cur
   }
 }"""
 
-PERIOD_MAP = {"day": "LAST_DAY", "week": "LAST_WEEK",
-              "month": "LAST_MONTH", "all": "ALL_TIME"}
-
-
-class TwitchProviderError(RuntimeError):
-    pass
+PERIOD_MAP = {
+    "day": "LAST_DAY",
+    "week": "LAST_WEEK",
+    "month": "LAST_MONTH",
+    "all": "ALL_TIME",
+}
 
 
 class TwitchGraphQLProvider(TwitchProvider):
-    def __init__(self, client_id: str = DEFAULT_WEB_CLIENT_ID, timeout: float = 20.0):
+    def __init__(self, client_id: str = DEFAULT_WEB_CLIENT_ID,
+                 timeout: float = 20.0, max_pages: int = 20):
         self._client_id = client_id or DEFAULT_WEB_CLIENT_ID
         self._timeout = timeout
+        self._max_pages = max(1, int(max_pages))
         self._session = requests.Session()
         self._session.headers.update({
             "Client-ID": self._client_id,
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Origin": "https://www.twitch.tv",
+            "Referer": "https://www.twitch.tv/",
         })
+        self._health_cache: Optional[Tuple[float, ProviderHealth]] = None
 
     @property
     def name(self) -> str:
         return "graphql"
 
-    def health_check(self) -> bool:
+    # ------------------------------------------------------------------ health
+    def check_health(self) -> ProviderHealth:
+        now = time.time()
+        if self._health_cache and now - self._health_cache[0] < 300:
+            return self._health_cache[1]
         try:
-            r = self._session.post(
-                GQL_URL, json={"query": "{ __typename }"}, timeout=self._timeout,
+            search = self._query(SEARCH_GAME, {"query": "Counter-Strike"})
+            edges = ((search.get("searchCategories") or {}).get("edges") or [])
+            if not edges:
+                raise TwitchSchemaError(
+                    "searchCategories returned no results for a known game"
+                )
+            game_id = (edges[0].get("node") or {}).get("id")
+            if not game_id:
+                raise TwitchSchemaError("searchCategories node has no id")
+            payload = self._query(GAME_CLIPS_BY_ID, {
+                "id": game_id,
+                "limit": 1,
+                "cursor": None,
+                "criteria": {"period": "LAST_WEEK"},
+            })
+            game = payload.get("game")
+            if game is None or not isinstance(game.get("clips"), dict):
+                raise TwitchSchemaError(
+                    "game.clips is missing; Twitch GraphQL schema may have changed"
+                )
+            health = ProviderHealth(
+                ok=True, provider=self.name,
+                detail=f"search+clips OK (game id {game_id})",
             )
-            return r.status_code == 200
-        except Exception:
-            return False
+        except TwitchAPIError as exc:
+            health = ProviderHealth(ok=False, provider=self.name,
+                                    detail=f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - health must not crash startup
+            health = ProviderHealth(ok=False, provider=self.name,
+                                    detail=f"{type(exc).__name__}: {exc}")
+        self._health_cache = (now, health)
+        return health
 
+    def health_check(self) -> bool:
+        return self.check_health().ok
+
+    # ------------------------------------------------------------------- query
     def _query(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
-        last_err: Optional[str] = None
+        last_error: Optional[str] = None
+        last_status: Optional[int] = None
         for attempt in range(3):
             try:
-                r = self._session.post(
+                response = self._session.post(
                     GQL_URL,
                     json={"query": query, "variables": variables},
                     timeout=self._timeout,
                 )
-            except requests.RequestException as e:
-                last_err = f"network: {e}"
+            except requests.RequestException as exc:
+                last_error = f"network error: {exc}"
+                log.warning("Twitch GraphQL attempt %d failed: %s",
+                            attempt + 1, exc)
                 time.sleep(1.5 ** attempt)
                 continue
-            if r.status_code == 200:
+
+            status = response.status_code
+            last_status = status
+            if status == 200:
                 try:
-                    payload = r.json()
+                    payload = response.json()
                 except ValueError:
-                    last_err = "invalid JSON in response"
+                    last_error = "invalid JSON in response"
+                    time.sleep(1.0 + attempt)
                     continue
-                if "errors" in payload:
-                    raise TwitchProviderError(f"GraphQL errors: {payload['errors']!r}")
-                return payload.get("data") or {}
-            if r.status_code in (429, 500, 502, 503, 504):
-                wait = float(r.headers.get("Retry-After", 2 ** attempt))
+                if not isinstance(payload, dict):
+                    raise TwitchSchemaError(
+                        f"Twitch GraphQL returned {type(payload).__name__}, "
+                        "expected object"
+                    )
+                errors = payload.get("errors")
+                if errors:
+                    message = str(errors[0] if errors else "unknown GraphQL error")
+                    raise TwitchSchemaError(
+                        f"Twitch GraphQL errors: {message[:500]}"
+                    )
+                data = payload.get("data")
+                if not isinstance(data, dict):
+                    raise TwitchSchemaError(
+                        "Twitch GraphQL response has no data object"
+                    )
+                return data
+            if status in (401, 403):
+                raise TwitchAuthError(
+                    f"Twitch rejected the public Client-ID (HTTP {status}): "
+                    f"{response.text[:200]}"
+                )
+            if status == 429:
+                wait = _retry_after(response, default=2.0 ** attempt)
+                last_error = f"rate limited (HTTP 429), waiting {wait:.1f}s"
+                log.warning("Twitch rate limit: waiting %.1fs", wait)
                 time.sleep(wait)
                 continue
-            raise TwitchProviderError(f"Twitch HTTP {r.status_code}: {r.text[:200]}")
-        raise TwitchProviderError(f"Twitch GraphQL: exhausted retries ({last_err})")
+            if 500 <= status < 600:
+                wait = _retry_after(response, default=2.0 ** attempt)
+                last_error = f"server error HTTP {status}"
+                time.sleep(wait)
+                continue
+            raise TwitchProviderError(
+                f"Twitch HTTP {status}: {response.text[:300]}"
+            )
 
+        if last_status == 429:
+            raise TwitchRateLimitError(
+                f"Twitch rate limit persisted after retries ({last_error})"
+            )
+        raise TwitchProviderError(
+            f"Twitch GraphQL request failed after retries: {last_error}"
+        )
+
+    # -------------------------------------------------------------------- game
+    def _resolve_game(self, game_name: str) -> Tuple[str, str]:
+        query_name = normalize_game_name(game_name) or game_name
+        data = self._query(SEARCH_GAME, {"query": query_name})
+        edges = ((data.get("searchCategories") or {}).get("edges") or [])
+        candidates: List[Dict[str, Any]] = []
+        for edge in edges:
+            node = (edge or {}).get("node") or {}
+            if node.get("id") and node.get("name"):
+                candidates.append(node)
+        if not candidates:
+            raise TwitchGameNotFound(
+                f"Game not found on Twitch: {game_name!r}. "
+                "Check the game name or try its official Twitch category name."
+            )
+        key = query_name.casefold()
+        chosen = next(
+            (node for node in candidates if str(node["name"]).casefold() == key),
+            candidates[0],
+        )
+        return str(chosen["id"]), str(chosen["name"])
+
+    # ------------------------------------------------------------------- clips
     def get_clips(self, game_name: str, limit: int, period: str = "week",
-                  max_pages: int = 10) -> List[TwitchClip]:
-        game_name = normalize_game_name(game_name)
-        
-        # 1. Ищем ID игры
-        search_data = self._query(SEARCH_GAME, {"query": game_name})
-        edges = search_data.get("searchCategories", {}).get("edges", [])
-        if not edges:
-            log.warning("Game not found via search: %s", game_name)
+                  max_pages: int = 20) -> List[TwitchClip]:
+        limit = int(limit)
+        if limit <= 0:
             return []
-        
-        game_id = edges[0]["node"]["id"]
-        official_game_name = edges[0]["node"]["name"]
-        log.info("Resolved game '%s' to ID %s", official_game_name, game_id)
+        game_id, official_name = self._resolve_game(game_name)
+        log.info("Resolved game %r to %r (id=%s)", game_name, official_name,
+                 game_id)
+        gql_period = PERIOD_MAP.get(period)
+        if gql_period is None:
+            raise ValueError(f"Unknown period: {period!r}")
+        pages = max(1, min(int(max_pages or self._max_pages), self._max_pages))
+        found: Dict[str, TwitchClip] = {}
+        cursor: Optional[str] = None
+        malformed = 0
 
-        # 2. Получаем клипы по ID
-        gql_period = PERIOD_MAP.get(period, "LAST_WEEK")
-        clips: List[TwitchClip] = []
-        cursor = None
-
-        for page in range(max_pages):
-            if len(clips) >= limit:
+        for page in range(pages):
+            if len(found) >= limit:
                 break
+            remaining = limit - len(found)
             try:
                 data = self._query(GAME_CLIPS_BY_ID, {
                     "id": game_id,
-                    "limit": min(100, limit - len(clips)),
+                    "limit": min(100, remaining),
                     "cursor": cursor,
                     "criteria": {"period": gql_period},
                 })
-            except TwitchProviderError as e:
-                log.error("Page %d failed: %s", page, e)
-                break
+            except TwitchAPIError as exc:
+                raise type(exc)(
+                    f"Twitch page {page + 1} for {official_name!r} failed: {exc}"
+                ) from exc
 
-            g = data.get("game")
-            if not g or not g.get("clips"):
-                break
-
-            clip_data = g.get("clips")
-            edges = clip_data.get("edges", [])
+            game = data.get("game")
+            if game is None:
+                raise TwitchSchemaError(
+                    "game is null in clips response; the category may no longer "
+                    "exist or the GraphQL schema changed"
+                )
+            clips_data = game.get("clips")
+            if not isinstance(clips_data, dict):
+                raise TwitchSchemaError(
+                    "game.clips is missing in the response; Twitch GraphQL "
+                    "schema may have changed"
+                )
+            edges = clips_data.get("edges") or []
             if not edges:
                 break
 
+            last_cursor = None
             for edge in edges:
-                n = edge["node"]
+                last_cursor = (edge or {}).get("cursor") or last_cursor
+                node = (edge or {}).get("node")
+                if not node:
+                    malformed += 1
+                    continue
                 try:
-                    clips.append(TwitchClip(
-                        id=n["id"],
-                        title=n.get("title") or "",
-                        game_name=official_game_name,
-                        broadcaster_name=(n.get("broadcaster") or {}).get("displayName") or "",
-                        url=n.get("url") or f"https://clips.twitch.tv/{n.get('slug')}",
-                        created_at=n.get("createdAt") or "",
-                        duration=float(n.get("durationSeconds") or 0),
-                        view_count=int(n.get("viewCount") or 0),
-                        thumbnail_url=n.get("thumbnailURL") or "",
-                    ))
-                except Exception as e:
-                    log.warning("Skipping malformed clip node: %s", e)
+                    clip = self._parse_node(node, official_name, game_id)
+                except (KeyError, TypeError, ValueError) as exc:
+                    malformed += 1
+                    log.warning("Skipping malformed Twitch clip node: %s", exc)
+                    continue
+                if clip.id and clip.id not in found:
+                    found[clip.id] = clip
 
-            if not clip_data.get("pageInfo", {}).get("hasNextPage"):
+            if len(found) >= limit:
                 break
-            cursor = edges[-1]["cursor"]
-            time.sleep(0.4)
-            
-        log.info("GraphQL: fetched %d clips for '%s'", len(clips), game_name)
-        return clips[:limit]
+            if not (clips_data.get("pageInfo") or {}).get("hasNextPage"):
+                break
+            if not last_cursor:
+                log.warning("hasNextPage is true but cursor is empty; stopping")
+                break
+            cursor = last_cursor
+            time.sleep(0.35)
+
+        result = list(found.values())[:limit]
+        if malformed and not result:
+            raise TwitchSchemaError(
+                f"All {malformed} clip nodes were malformed; "
+                "Twitch GraphQL schema may have changed"
+            )
+        log.info("GraphQL: fetched %d clip(s) for %r (period=%s)",
+                 len(result), official_name, period)
+        return result
+
+    @staticmethod
+    def _parse_node(node: Dict[str, Any], game_name: str,
+                    game_id: str) -> TwitchClip:
+        clip_id = str(node["id"]).strip()
+        if not clip_id:
+            raise ValueError("empty clip id")
+        broadcaster = node.get("broadcaster") or {}
+        url = str(node.get("url") or "")
+        slug = str(node.get("slug") or "")
+        if not url and slug:
+            url = f"https://clips.twitch.tv/{slug}"
+        return TwitchClip(
+            id=clip_id,
+            title=str(node.get("title") or ""),
+            game_name=game_name,
+            broadcaster_name=str(broadcaster.get("displayName")
+                                 or broadcaster.get("login") or ""),
+            url=url,
+            created_at=str(node.get("createdAt") or ""),
+            duration=float(node.get("durationSeconds") or 0),
+            view_count=int(node.get("viewCount") or 0),
+            thumbnail_url=str(node.get("thumbnailURL") or ""),
+            game_id=game_id,
+            slug=slug,
+        )
+
+
+def _retry_after(response: Any, default: float) -> float:
+    value = (getattr(response, "headers", {}) or {}).get("Retry-After")
+    try:
+        wait = float(value)
+    except (TypeError, ValueError):
+        return max(0.5, min(default, 30.0))
+    return max(0.5, min(wait, 30.0))

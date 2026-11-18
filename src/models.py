@@ -1,10 +1,13 @@
-"""Domain models shared across modules."""
+"""Domain models shared across pipeline stages."""
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class TwitchClip:
+    """A clip returned by a Twitch provider."""
+
     id: str
     title: str
     game_name: str
@@ -14,14 +17,17 @@ class TwitchClip:
     duration: float
     view_count: int
     thumbnail_url: str = ""
+    game_id: str = ""
+    slug: str = ""
 
 
 @dataclass
 class AudioEvent:
-    kind: str  # loud | pause | laughter | scream
+    kind: str  # loud | reaction | scream | laughter | pause | noise | onset
     start: float
     end: float
     intensity: float = 1.0
+    speech_overlap: bool = False
 
 
 @dataclass
@@ -46,12 +52,15 @@ class AudioAnalysisResult:
     words: List[TranscriptWord]
     events: List[AudioEvent]
     full_text: str
+    model: str = ""
+    source_fingerprint: str = ""
 
 
 @dataclass
 class FrameDescription:
     timestamp: float
     description: str
+    path: str = ""
 
 
 @dataclass
@@ -59,6 +68,9 @@ class VisionAnalysisResult:
     duration: float
     frames: List[FrameDescription]
     sequence_summary: str
+    model: str = ""
+    scene_changes: List[float] = field(default_factory=list)
+    source_fingerprint: str = ""
 
 
 @dataclass
@@ -79,3 +91,56 @@ class CuratorDecision:
     best_moment_end: float
     reason: str
     raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DownloadResult:
+    """Result of a download stage."""
+
+    path: Path
+    duration: float
+    size: int
+    skipped: bool = False
+
+
+@dataclass
+class Moment:
+    """Final edit window selected around the AI peak."""
+
+    start: float
+    end: float
+    reason: str = ""
+    expanded: bool = False
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+@dataclass
+class RenderResult:
+    """Verified result of a render."""
+
+    path: Path
+    width: int
+    height: int
+    duration: float
+    has_audio: bool
+
+
+@dataclass
+class StageResult:
+    """Structured result returned by a pipeline stage."""
+
+    stage: str
+    ok: bool
+    data: Any = None
+    error: str = ""
+    elapsed: float = 0.0
+
+
+@dataclass
+class ProviderHealth:
+    ok: bool
+    provider: str
+    detail: str = ""
