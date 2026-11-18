@@ -103,8 +103,7 @@ def _check_ollama(cfg, require_ai: bool) -> Tuple[List[str], List[str]]:
         return errors, warnings
 
     for role, model in (("text", cfg.ollama_text_model),
-                        ("vision", cfg.ollama_vision_model),
-                        ("fast", cfg.ollama_fast_model)):
+                        ("vision", cfg.ollama_vision_model)):
         if model and not model_installed(installed, model):
             errors.append(
                 f"Ollama model for {role} is not installed: {model}. "

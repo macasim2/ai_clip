@@ -215,7 +215,8 @@ class Pipeline:
             # 2. Audio + vision, reusing saved analysis after a restart.
             stage = "analysis"
             audio, vision = (None, None)
-            if status in ("ANALYZED", "APPROVED", "EDITING", "ANALYZING"):
+            if status in ("ANALYZED", "APPROVED", "EDITING", "ANALYZING",
+                          "DOWNLOADED"):
                 audio, vision = self._load_analysis(clip_id)
             if audio is None:
                 if status != "ANALYZING":

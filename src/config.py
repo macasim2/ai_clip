@@ -87,7 +87,6 @@ class Config:
     ollama_url: str = "http://localhost:11434"
     ollama_text_model: str = "llama3.2:latest"
     ollama_vision_model: str = "llava:latest"
-    ollama_fast_model: str = ""
     ollama_timeout: float = 240.0
     ollama_keep_alive: str = "2m"
     ollama_num_ctx: int = 4096
@@ -309,7 +308,6 @@ def load_config(read_env: bool = True,
     cfg.ollama_text_model = _getstr("OLLAMA_TEXT_MODEL", cfg.ollama_text_model)
     cfg.ollama_vision_model = _getstr("OLLAMA_VISION_MODEL",
                                       cfg.ollama_vision_model)
-    cfg.ollama_fast_model = _getstr("OLLAMA_FAST_MODEL", cfg.ollama_fast_model)
     cfg.ollama_timeout = _getfloat("OLLAMA_TIMEOUT", cfg.ollama_timeout)
     cfg.ollama_keep_alive = _getstr("OLLAMA_KEEP_ALIVE", cfg.ollama_keep_alive)
     cfg.ollama_num_ctx = _getint("OLLAMA_NUM_CTX", cfg.ollama_num_ctx)

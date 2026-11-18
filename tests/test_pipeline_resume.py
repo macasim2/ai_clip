@@ -324,3 +324,53 @@ def test_reject_with_low_weighted_score_is_rejected(db, sample_video,
     assert database.get_clip("c1")["status"] == "REJECTED"
 
 
+def test_resume_from_editing_does_not_rerun_ai(db, sample_video, monkeypatch):
+    cfg, database = db
+    database.upsert_clip(make_clip())
+    database.update_status("c1", "DOWNLOADING")
+    database.set_local_path("c1", sample_video)
+    database.update_status("c1", "DOWNLOADED")
+    database.update_status("c1", "ANALYZING")
+    database.save_analysis(
+        "c1",
+        json.dumps({"language": "ru", "duration": 2.0, "full_text": "wow",
+                    "events": [], "segments": [],
+                    "words": [{"start": 0.2, "end": 0.6, "word": "wow"}]}),
+        json.dumps({"duration": 2.0, "frames": [], "sequence_summary": ""}),
+    )
+    database.update_status("c1", "ANALYZED")
+    database.save_decision("c1", {
+        "category": "Экшен", "overall_score": 85,
+        "best_moment_start": 0.2, "best_moment_end": 1.2,
+        "decision": "candidate", "confidence": 0.9, "reason": "cached",
+    }, "APPROVED")
+    database.update_status("c1", "EDITING")
+
+    calls = patch_success(monkeypatch, sample_video)
+    monkeypatch.setattr("src.pipeline.analyze_audio",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr("src.pipeline.analyze_clip",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    pipeline = Pipeline(cfg, database, twitch=object())
+    result = pipeline.process_one("c1")
+    assert result["ok"] is True
+    assert calls["render"] == 1
+    assert database.get_clip("c1")["status"] == "READY"
+
+
+def test_audio_failure_is_analysis_error(db, sample_video, monkeypatch):
+    cfg, database = db
+    database.upsert_clip(make_clip())
+    patch_success(monkeypatch, sample_video)
+    monkeypatch.setattr("src.pipeline.analyze_audio",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("whisper unavailable")))
+    pipeline = Pipeline(cfg, database, twitch=object())
+    result = pipeline.process_one("c1")
+    assert result["ok"] is False
+    row = database.get_clip("c1")
+    assert row["status"] == "ANALYSIS_ERROR"
+    assert "whisper unavailable" in row["error_message"]
+
+
+

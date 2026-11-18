@@ -26,7 +26,7 @@ set "PY=.venv\Scripts\python.exe"
 if errorlevel 1 (
     echo [ERROR] Unsupported Python version:
     "%PY%" -c "import sys; print(sys.version)"
-    echo Install Python 3.12 (recommended) or 3.14 and recreate .venv.
+    echo Install Python 3.12 or 3.14 and recreate .venv.
     pause
     exit /b 1
 )

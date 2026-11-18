@@ -140,7 +140,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     retry.add_argument("--clip", default=None)
     retry.add_argument("--from-stage", default="download",
                        choices=["download", "analysis", "edit"])
-    retry.add_argument("--all-failed", action="store_true")
 
     status = sub.add_parser("status", help="Show queue and history")
     status.add_argument("--clip", default=None)

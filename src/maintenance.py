@@ -55,7 +55,8 @@ def cleanup(cfg, db: Database, days: Optional[int] = None,
         if row["status"] not in ("READY", "REJECTED"):
             kept += 1
             continue
-        candidates = [work / "frames", work / "audio.wav", work / "temp",
+        candidates = [work / "frames", work / "audio.wav",
+                      work / "audio.wav.meta.json", work / "temp",
                       work / ".tmp"]
         for candidate in candidates:
             if not candidate.exists():
